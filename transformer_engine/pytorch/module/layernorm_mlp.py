@@ -657,6 +657,9 @@ class _LayerNormMLP(torch.autograd.Function):
             ctx.activation_params = activation_params
             ctx.fp8 = fp8
             ctx.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe() if fp8 else None
+            ctx.fp8_bwd = True
+            if ctx.fp8_recipe is not None:
+                ctx.fp8_bwd = getattr(ctx.fp8_recipe, "fp8_bwd", True)
             ctx.fuse_wgrad_accumulation = fuse_wgrad_accumulation
             ctx.cpu_offloading = cpu_offloading
             ctx.is_first_microbatch = is_first_microbatch
@@ -752,6 +755,8 @@ class _LayerNormMLP(torch.autograd.Function):
             if ctx.fuse_wgrad_accumulation:
                 origin_fc1_weight.main_grad = fc1_weight_main_grad
                 origin_fc2_weight.main_grad = fc2_weight_main_grad
+
+            use_fp8_bwd = ctx.fp8 and getattr(ctx, "fp8_bwd", True)
 
             # TODO: Fix this  # pylint: disable=fixme
             # Gather saved autograd context tensors when running with FSDP
@@ -874,20 +879,47 @@ class _LayerNormMLP(torch.autograd.Function):
             ):
                 ctx.fc2_weight.update_usage(columnwise_usage=True)
 
+            fc2_weight_for_dgrad = fc2_weight
+            grad_output_for_dgrad = grad_output
+            gelu_in_for_dgrad = fc1_out if fc2_dgrad_gemm_gelu_fusion else None
+            if not use_fp8_bwd:
+                fc2_weight_for_dgrad = origin_fc2_weight
+                if isinstance(fc2_weight_for_dgrad, QuantizedTensorStorage):
+                    fc2_weight_for_dgrad = fc2_weight_for_dgrad.dequantize(
+                        dtype=ctx.activation_dtype
+                    )
+                else:
+                    fc2_weight_for_dgrad = cast_if_needed(
+                        fc2_weight_for_dgrad, ctx.activation_dtype
+                    )
+                if isinstance(grad_output_for_dgrad, QuantizedTensorStorage):
+                    grad_output_for_dgrad = grad_output_for_dgrad.dequantize(
+                        dtype=ctx.activation_dtype
+                    )
+                else:
+                    grad_output_for_dgrad = cast_if_needed(
+                        grad_output_for_dgrad, ctx.activation_dtype
+                    )
+                if gelu_in_for_dgrad is not None:
+                    if isinstance(gelu_in_for_dgrad, QuantizedTensorStorage):
+                        gelu_in_for_dgrad = gelu_in_for_dgrad.dequantize(dtype=ctx.activation_dtype)
+                    else:
+                        gelu_in_for_dgrad = cast_if_needed(gelu_in_for_dgrad, ctx.activation_dtype)
+
             # Perform GEMM
             gemm_output, *_ = general_gemm(
-                fc2_weight,
-                grad_output,
+                fc2_weight_for_dgrad,
+                grad_output_for_dgrad,
                 layout="NN",
                 grad=True,
                 quantization_params=(
                     ctx.fc1_grad_input_quantizer
-                    if fc2_dgrad_gemm_gelu_fusion or ctx.debug
+                    if use_fp8_bwd and (fc2_dgrad_gemm_gelu_fusion or ctx.debug)
                     else None
                 ),  # high precision to activation
                 out_dtype=ctx.activation_dtype,
                 gelu=fc2_dgrad_gemm_gelu_fusion,
-                gelu_in=fc1_out if fc2_dgrad_gemm_gelu_fusion else None,
+                gelu_in=gelu_in_for_dgrad,
                 use_split_accumulator=dgrad_use_split_accumulator,
                 ub=ub_obj_fc2_dgrad,
                 ub_type=tex.CommOverlapType.AG if ctx.ub_overlap_ag else None,
@@ -964,6 +996,22 @@ class _LayerNormMLP(torch.autograd.Function):
                         ctx.fc2_grad_output_quantizer.set_usage(rowwise=False, columnwise=True)
                         grad_output = ctx.fc2_grad_output_quantizer(grad_output)
 
+                act_out_for_wgrad = act_out
+                grad_output_for_wgrad = grad_output
+                if not use_fp8_bwd:
+                    if isinstance(act_out_for_wgrad, QuantizedTensorStorage):
+                        act_out_for_wgrad = act_out_for_wgrad.dequantize(dtype=ctx.activation_dtype)
+                    else:
+                        act_out_for_wgrad = cast_if_needed(act_out_for_wgrad, ctx.activation_dtype)
+                    if isinstance(grad_output_for_wgrad, QuantizedTensorStorage):
+                        grad_output_for_wgrad = grad_output_for_wgrad.dequantize(
+                            dtype=ctx.activation_dtype
+                        )
+                    else:
+                        grad_output_for_wgrad = cast_if_needed(
+                            grad_output_for_wgrad, ctx.activation_dtype
+                        )
+
                 # Whether to set grad arg in general_gemm
                 grad_arg = True
                 if ctx.fp8 and ctx.fp8_recipe.float8_block_scaling():
@@ -976,7 +1024,9 @@ class _LayerNormMLP(torch.autograd.Function):
                         if ctx.fuse_wgrad_accumulation
                         else ctx.activation_dtype
                     ),
-                    "quantization_params": ctx.fc2_grad_weight_quantizer,  # wgrad in high precision
+                    "quantization_params": (
+                        ctx.fc2_grad_weight_quantizer if use_fp8_bwd else None
+                    ),  # wgrad in high precision
                     "accumulate": (
                         accumulate_wgrad_into_param_main_grad
                         if not getattr(fc1_weight, "overwrite_main_grad", False)
@@ -1004,11 +1054,13 @@ class _LayerNormMLP(torch.autograd.Function):
 
                 # Choose whether to call wgrad GEMM now or delay
                 if ctx.wgrad_store is not None and ctx.wgrad_store.delay_wgrad_compute():
-                    ctx.wgrad_store.put([act_out, grad_output], fc2_wgrad_gemm)
+                    ctx.wgrad_store.put([act_out_for_wgrad, grad_output_for_wgrad], fc2_wgrad_gemm)
                 else:
 
                     # Call wgrad GEMM now
-                    fc2_wgrad, fc2_bias_grad_ = fc2_wgrad_gemm(act_out, grad_output)
+                    fc2_wgrad, fc2_bias_grad_ = fc2_wgrad_gemm(
+                        act_out_for_wgrad, grad_output_for_wgrad
+                    )
 
                     # Update grad bias if needed
                     if fc2_bias_grad is None:
@@ -1136,13 +1188,30 @@ class _LayerNormMLP(torch.autograd.Function):
             if ctx.ub_bulk_wgrad:
                 gemm_out = ub_obj_fc1_wgrad.get_buffer(local_chunk=False)
 
+            fc1_weight_for_dgrad = fc1_weight
+            dact_for_dgrad = dact
+            if not use_fp8_bwd:
+                fc1_weight_for_dgrad = origin_fc1_weight
+                if isinstance(fc1_weight_for_dgrad, QuantizedTensorStorage):
+                    fc1_weight_for_dgrad = fc1_weight_for_dgrad.dequantize(
+                        dtype=ctx.activation_dtype
+                    )
+                else:
+                    fc1_weight_for_dgrad = cast_if_needed(
+                        fc1_weight_for_dgrad, ctx.activation_dtype
+                    )
+                if isinstance(dact_for_dgrad, QuantizedTensorStorage):
+                    dact_for_dgrad = dact_for_dgrad.dequantize(dtype=ctx.activation_dtype)
+                else:
+                    dact_for_dgrad = cast_if_needed(dact_for_dgrad, ctx.activation_dtype)
+
             # dgrad GEMM
             gemm_out, *_, reduce_scatter_out = general_gemm(
-                fc1_weight,
-                dact,
+                fc1_weight_for_dgrad,
+                dact_for_dgrad,
                 out=gemm_out,
                 out_dtype=ctx.activation_dtype,
-                quantization_params=ctx.fc1_grad_input_quantizer,
+                quantization_params=ctx.fc1_grad_input_quantizer if use_fp8_bwd else None,
                 layout="NN",
                 grad=True,
                 use_split_accumulator=dgrad_use_split_accumulator,
@@ -1208,6 +1277,22 @@ class _LayerNormMLP(torch.autograd.Function):
                         ctx.fc1_grad_output_quantizer.set_usage(rowwise=False, columnwise=True)
                         dact = ctx.fc1_grad_output_quantizer(dact)
 
+                ln_out_total_for_wgrad = ln_out_total
+                dact_for_wgrad = dact
+                if not use_fp8_bwd:
+                    if isinstance(ln_out_total_for_wgrad, QuantizedTensorStorage):
+                        ln_out_total_for_wgrad = ln_out_total_for_wgrad.dequantize(
+                            dtype=ctx.activation_dtype
+                        )
+                    else:
+                        ln_out_total_for_wgrad = cast_if_needed(
+                            ln_out_total_for_wgrad, ctx.activation_dtype
+                        )
+                    if isinstance(dact_for_wgrad, QuantizedTensorStorage):
+                        dact_for_wgrad = dact_for_wgrad.dequantize(dtype=ctx.activation_dtype)
+                    else:
+                        dact_for_wgrad = cast_if_needed(dact_for_wgrad, ctx.activation_dtype)
+
                 # Output buffer for overlapping grad input
                 # reduce-scatter with wgrad GEMM
                 reduce_scatter_out = None
@@ -1223,7 +1308,7 @@ class _LayerNormMLP(torch.autograd.Function):
                         if ctx.fuse_wgrad_accumulation
                         else ctx.activation_dtype
                     ),
-                    "quantization_params": ctx.fc1_grad_weight_quantizer,
+                    "quantization_params": (ctx.fc1_grad_weight_quantizer if use_fp8_bwd else None),
                     "accumulate": (
                         accumulate_wgrad_into_param_main_grad
                         if not getattr(fc2_weight, "overwrite_main_grad", False)
@@ -1266,13 +1351,13 @@ class _LayerNormMLP(torch.autograd.Function):
                             "Delayed weight grad computation is not supported "
                             "with Userbuffers (tensor-parallel communication overlapping)"
                         )
-                    ctx.wgrad_store.put([ln_out_total, dact], fc1_wgrad_gemm)
+                    ctx.wgrad_store.put([ln_out_total_for_wgrad, dact_for_wgrad], fc1_wgrad_gemm)
                     if fuse_gemm_and_bias_fc1_wgrad:
                         fc1_bias_grad = None
                 else:
 
                     # Call wgrad GEMM now
-                    fc1_wgrad_outputs = fc1_wgrad_gemm(ln_out_total, dact)
+                    fc1_wgrad_outputs = fc1_wgrad_gemm(ln_out_total_for_wgrad, dact_for_wgrad)
                     if fuse_gemm_and_bias_fc1_wgrad:
                         fc1_wgrad, fc1_bias_grad = fc1_wgrad_outputs
                     else:

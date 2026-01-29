@@ -496,6 +496,9 @@ class _LayerNormLinear(torch.autograd.Function):
             ctx.activation_dtype = activation_dtype
             ctx.fp8 = fp8
             ctx.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe() if fp8 else None
+            ctx.fp8_bwd = True
+            if ctx.fp8_recipe is not None:
+                ctx.fp8_bwd = getattr(ctx.fp8_recipe, "fp8_bwd", True)
             ctx.fuse_wgrad_accumulation = fuse_wgrad_accumulation
             ctx.cpu_offloading = cpu_offloading
             ctx.is_first_microbatch = is_first_microbatch
@@ -623,6 +626,8 @@ class _LayerNormLinear(torch.autograd.Function):
                     ub_obj_wgrad = get_ub(ctx.ub_name + "_wgrad", ctx.fp8)
                     ub_type_wgrad = tex.CommOverlapType.RS
 
+            use_fp8_bwd = ctx.fp8 and getattr(ctx, "fp8_bwd", True)
+
             # --------------------------------------------------
             # Prepare grad output tensor
             # Note: Cast to expected dtype and perform tensor-parallel communication
@@ -733,12 +738,29 @@ class _LayerNormLinear(torch.autograd.Function):
             # dgrad GEMM
             # Note: dx = dy * w
             nvtx_range_push(f"{nvtx_label}.dgrad_gemm")
+            weight_for_dgrad = weight
+            grad_output_for_dgrad = grad_output
+            if not use_fp8_bwd:
+                weight_for_dgrad = origin_weight
+                if isinstance(weight_for_dgrad, QuantizedTensorStorage):
+                    weight_for_dgrad = weight_for_dgrad.dequantize(dtype=ctx.activation_dtype)
+                else:
+                    weight_for_dgrad = cast_if_needed(weight_for_dgrad, ctx.activation_dtype)
+                if isinstance(grad_output_for_dgrad, QuantizedTensorStorage):
+                    grad_output_for_dgrad = grad_output_for_dgrad.dequantize(
+                        dtype=ctx.activation_dtype
+                    )
+                else:
+                    grad_output_for_dgrad = cast_if_needed(
+                        grad_output_for_dgrad, ctx.activation_dtype
+                    )
+
             gemm_out, *_, reduce_scatter_out = general_gemm(
-                weight,
-                grad_output,
+                weight_for_dgrad,
+                grad_output_for_dgrad,
                 layout="NN",
                 grad=True,
-                quantization_params=ctx.grad_input_quantizer,
+                quantization_params=ctx.grad_input_quantizer if use_fp8_bwd else None,
                 out=gemm_out,
                 out_dtype=ctx.activation_dtype,
                 use_split_accumulator=use_split_accumulator,
@@ -865,7 +887,7 @@ class _LayerNormLinear(torch.autograd.Function):
                     "out_dtype": (
                         main_grad.dtype if ctx.fuse_wgrad_accumulation else ctx.activation_dtype
                     ),
-                    "quantization_params": ctx.grad_weight_quantizer,
+                    "quantization_params": ctx.grad_weight_quantizer if use_fp8_bwd else None,
                     "accumulate": (
                         accumulate_wgrad_into_param_main_grad
                         if not getattr(weight, "overwrite_main_grad", False)
@@ -899,6 +921,26 @@ class _LayerNormLinear(torch.autograd.Function):
                     nvtx_range_pop(f"{nvtx_label}.wgrad_gemm")
                     return dw, db
 
+                ln_out_total_for_wgrad = ln_out_total
+                grad_output_for_wgrad = grad_output
+                if not use_fp8_bwd:
+                    if isinstance(ln_out_total_for_wgrad, QuantizedTensorStorage):
+                        ln_out_total_for_wgrad = ln_out_total_for_wgrad.dequantize(
+                            dtype=ctx.activation_dtype
+                        )
+                    else:
+                        ln_out_total_for_wgrad = cast_if_needed(
+                            ln_out_total_for_wgrad, ctx.activation_dtype
+                        )
+                    if isinstance(grad_output_for_wgrad, QuantizedTensorStorage):
+                        grad_output_for_wgrad = grad_output_for_wgrad.dequantize(
+                            dtype=ctx.activation_dtype
+                        )
+                    else:
+                        grad_output_for_wgrad = cast_if_needed(
+                            grad_output_for_wgrad, ctx.activation_dtype
+                        )
+
                 # Choose whether to call wgrad GEMM now or delay
                 if ctx.wgrad_store is not None and ctx.wgrad_store.delay_wgrad_compute():
                     if (
@@ -911,11 +953,10 @@ class _LayerNormLinear(torch.autograd.Function):
                             "Delayed weight grad computation is not supported "
                             "with Userbuffers (tensor-parallel communication overlapping)"
                         )
-                    ctx.wgrad_store.put([ln_out_total, grad_output], wgrad_gemm)
+                    ctx.wgrad_store.put([ln_out_total_for_wgrad, grad_output_for_wgrad], wgrad_gemm)
                 else:
-
                     # Call wgrad GEMM now
-                    wgrad, grad_bias_ = wgrad_gemm(ln_out_total, grad_output)
+                    wgrad, grad_bias_ = wgrad_gemm(ln_out_total_for_wgrad, grad_output_for_wgrad)
 
                     # Update grad bias if needed
                     if grad_bias is None:
