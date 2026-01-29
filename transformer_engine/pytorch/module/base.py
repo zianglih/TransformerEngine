@@ -3,6 +3,7 @@
 # See LICENSE for license information.
 
 """Base modules and utilities for TransformerEngine PyTorch API"""
+
 import io
 import math
 import os
@@ -50,11 +51,16 @@ from ..utils import (
     torch_get_autocast_gpu_dtype,
     get_nvtx_range_context,
 )
-from ..tensor.storage.float8_blockwise_tensor_storage import Float8BlockwiseQTensorStorage
+from ..tensor.storage.float8_blockwise_tensor_storage import (
+    Float8BlockwiseQTensorStorage,
+)
 from ...common.recipe import DelayedScaling, Recipe
 from ...debug.pytorch.debug_state import TEDebugState
 from ...debug.pytorch.debug_quantization import DebugQuantizer, DebugQuantizedTensor
-from ...debug.pytorch.utils import next_iter_when_debug_should_be_run, any_feature_enabled
+from ...debug.pytorch.utils import (
+    next_iter_when_debug_should_be_run,
+    any_feature_enabled,
+)
 
 __all__ = ["initialize_ub", "destroy_ub", "UserBufferQuantizationMode"]
 
@@ -166,7 +172,9 @@ def initialize_ub(
             DeprecationWarning,
         )
         quantization_modes = [
-            UserBufferQuantizationMode.FP8 if use_fp8 else UserBufferQuantizationMode.NONE
+            UserBufferQuantizationMode.FP8
+            if use_fp8
+            else UserBufferQuantizationMode.NONE
         ]
     else:
         assert isinstance(quantization_modes, list), "quantization_modes must be a list"
@@ -177,9 +185,9 @@ def initialize_ub(
     if isinstance(ub_cfgs, dict) or ub_cfgs is None:
         ub_cfgs = [ub_cfgs] * len(quantization_modes)
     else:
-        assert len(ub_cfgs) == len(
-            quantization_modes
-        ), "Number of ub_cfgs settings must match number of quantization configurations"
+        assert len(ub_cfgs) == len(quantization_modes), (
+            "Number of ub_cfgs settings must match number of quantization configurations"
+        )
 
     global _ub_communicators
     assert _ub_communicators is None, "UB communicators are already initialized."
@@ -194,9 +202,9 @@ def initialize_ub(
     else:
         # Bootstrapping with torch.distributed API, so check backend and construct
         # intra/inter-node process groups...
-        assert (
-            torch.distributed.is_initialized()
-        ), "torch.distributed must be initialized before Userbuffers"
+        assert torch.distributed.is_initialized(), (
+            "torch.distributed must be initialized before Userbuffers"
+        )
         if bootstrap_backend is None:
             bootstrap_backend = "nccl"
             if torch.distributed.is_mpi_available():
@@ -259,7 +267,12 @@ def initialize_ub(
         "fc2_dgrad",
         "fc2_wgrad",
     ]
-    layers_reduce_scatter_overlap = ["proj_fprop", "fc2_fprop", "qkv_wgrad", "fc1_wgrad"]
+    layers_reduce_scatter_overlap = [
+        "proj_fprop",
+        "fc2_fprop",
+        "qkv_wgrad",
+        "fc1_wgrad",
+    ]
     dgrad_reduce_scatter_overlap = ["qkv_dgrad", "fc1_dgrad"]
     # Default overlap methods for layers
     methods = {
@@ -331,9 +344,9 @@ def initialize_ub(
             warnings.warn(
                 "Atomic GEMM uses a beta API from cublas and is not tested for all use cases."
             )
-            assert (
-                quantization_mode == UserBufferQuantizationMode.FP8
-            ), "Atomic GEMM overlap supported only for FP8 GEMM."
+            assert quantization_mode == UserBufferQuantizationMode.FP8, (
+                "Atomic GEMM overlap supported only for FP8 GEMM."
+            )
             if method in ("bulk", "external"):
                 warnings.warn(
                     f"At {name}, atoimic GEMM not is supported for a bulk overlap."
@@ -361,7 +374,9 @@ def initialize_ub(
                 assert atomic_gemm and method == "ring_exchange", assert_message
             else:
                 if atomic_gemm and method == "ring_exchange":
-                    assert rs_ag_pairs[name] in layers_atomic_ring_exchange, assert_message
+                    assert rs_ag_pairs[name] in layers_atomic_ring_exchange, (
+                        assert_message
+                    )
 
         if name in external_gemm_to_overlap:
             assert method == "external", (
@@ -431,12 +446,16 @@ def initialize_ub(
                     methods[new_method].append(name)
 
         for name in (
-            methods["ring_exchange"] + methods["pipeline"] + methods["bulk"] + methods["external"]
+            methods["ring_exchange"]
+            + methods["pipeline"]
+            + methods["bulk"]
+            + methods["external"]
         ):
             ub_cfg = get_default_config(name)
             if user_ub_cfg is not None and name in user_ub_cfg:
                 fp8_buf = (name in layers_all_gather_overlap) or (
-                    user_ub_cfg[name].get("fp8_buf", False) and name in methods["pipeline"]
+                    user_ub_cfg[name].get("fp8_buf", False)
+                    and name in methods["pipeline"]
                 )
                 ub_cfg.update(user_ub_cfg[name])
                 ub_cfg["fp8_buf"] = fp8_buf
@@ -448,9 +467,14 @@ def get_ub(name: str, use_fp8: bool):
     # For now use `use_fp8` boolean input as it matches the current design in the modules
     # So favour simplicity until the correct design becomes clear.
     # This is mainly an internal API so we don't need to worry about future changes
-    key = (name, UserBufferQuantizationMode.FP8 if use_fp8 else UserBufferQuantizationMode.NONE)
+    key = (
+        name,
+        UserBufferQuantizationMode.FP8 if use_fp8 else UserBufferQuantizationMode.NONE,
+    )
     assert _ub_communicators is not None, "UB manager is not initialized."
-    assert key in _ub_communicators, f"UB for {name} with use_fp8={use_fp8} is not registered."
+    assert key in _ub_communicators, (
+        f"UB for {name} with use_fp8={use_fp8} is not registered."
+    )
     return _ub_communicators[key]
 
 
@@ -467,7 +491,9 @@ def fill_userbuffers_buffer_for_all_gather(
     local_tensor: torch.Tensor,
     quantizer: Optional[Quantizer],
     process_group,
-) -> tuple[torch.Tensor | QuantizedTensorStorage, torch.Tensor | QuantizedTensorStorage]:
+) -> tuple[
+    torch.Tensor | QuantizedTensorStorage, torch.Tensor | QuantizedTensorStorage
+]:
     """Fill local shard of Userbuffers buffer with data for all-gather
 
     Returns the full tensor and the local shard, both using the
@@ -526,7 +552,6 @@ def fill_userbuffers_buffer_for_all_gather(
 
     # MXFP8 data
     if isinstance(quantizer, MXFP8Quantizer):
-
         # Cast to MXFP8 if needed
         if not isinstance(local_tensor, MXFP8TensorStorage):
             if isinstance(local_tensor, QuantizedTensorStorage):
@@ -549,7 +574,9 @@ def fill_userbuffers_buffer_for_all_gather(
 
         # Copy MXFP8 data to local chunk of Userbuffers buffer
         local_data = (
-            local_tensor._rowwise_data if with_rowwise_data else local_tensor._columnwise_data
+            local_tensor._rowwise_data
+            if with_rowwise_data
+            else local_tensor._columnwise_data
         )
         comm.copy_into_buffer(local_data, local_chunk=True)
 
@@ -619,7 +646,9 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
         self.sequence_parallel = False
         self.param_init_meta = {}
         self.primary_weights_in_fp8 = FP8GlobalStateManager.with_fp8_parameters()
-        self.preserve_high_precision_init_val = FP8GlobalStateManager.with_high_precision_init_val()
+        self.preserve_high_precision_init_val = (
+            FP8GlobalStateManager.with_high_precision_init_val()
+        )
         self.fsdp_wrapped = False
         self.fsdp_group = None
         self._fp8_workspaces: Dict[str, QuantizedTensor] = {}
@@ -650,7 +679,9 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
             # Default case
             super().__setattr__(name, value)
 
-    def adjust_amax_history_length(self, length: int, fwd: Optional[bool] = None) -> None:
+    def adjust_amax_history_length(
+        self, length: int, fwd: Optional[bool] = None
+    ) -> None:
         """
         Delayed scaling only.
 
@@ -694,14 +725,15 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
                 for pos, buffer_key in zip((fwd_pos, bwd_pos), (fwd_key, bwd_key)):
                     if buffer_key in FP8GlobalStateManager.global_amax_buffer:
                         assert (
-                            buffer_key in FP8GlobalStateManager.global_amax_history_buffer
+                            buffer_key
+                            in FP8GlobalStateManager.global_amax_history_buffer
                         ), "TE internal error during amax history change."
-                        FP8GlobalStateManager.global_amax_buffer[buffer_key][pos] = self.fp8_meta[
-                            meta_key
-                        ].amax_history[0]
-                        FP8GlobalStateManager.global_amax_history_buffer[buffer_key][pos] = (
-                            self.fp8_meta[meta_key].amax_history
+                        FP8GlobalStateManager.global_amax_buffer[buffer_key][pos] = (
+                            self.fp8_meta[meta_key].amax_history[0]
                         )
+                        FP8GlobalStateManager.global_amax_history_buffer[buffer_key][
+                            pos
+                        ] = self.fp8_meta[meta_key].amax_history
 
     def set_meta_tensor(self, fwd: bool, recipe: Recipe) -> None:
         """Init scales and amaxes for fwd | bwd."""
@@ -713,7 +745,9 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
             if recipe.delayed() and isinstance(recipe_state, DelayedScalingRecipeState):
                 self.adjust_amax_history_length(recipe.amax_history_len, fwd=fwd)
                 return
-            if recipe.mxfp8() and isinstance(recipe_state, MXFP8BlockScalingRecipeState):
+            if recipe.mxfp8() and isinstance(
+                recipe_state, MXFP8BlockScalingRecipeState
+            ):
                 return
             if recipe.float8_current_scaling() and isinstance(
                 recipe_state, Float8CurrentScalingRecipeState
@@ -723,12 +757,16 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
                 recipe_state, Float8BlockScalingRecipeState
             ):
                 return
-            if recipe.nvfp4() and isinstance(recipe_state, NVFP4BlockScalingRecipeState):
+            if recipe.nvfp4() and isinstance(
+                recipe_state, NVFP4BlockScalingRecipeState
+            ):
                 return
 
         # Max. number of fp8 tensors per GEMM = 3 (input, weight, output) for fwd and
         # 2 (grad_output and grad_input) for bwd
-        num_fp8_tensors = self.fp8_meta["num_gemms"] * 3 if fwd else self.fp8_meta["num_gemms"] * 2
+        num_fp8_tensors = (
+            self.fp8_meta["num_gemms"] * 3 if fwd else self.fp8_meta["num_gemms"] * 2
+        )
 
         # Initialize recipe state and quantizers
         recipe_state = RecipeState.create(
@@ -790,7 +828,9 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
         def reset(key):
             if key in self.fp8_meta:
                 if fp8_meta_tensors is None:
-                    self.fp8_meta[key].scale.copy_(torch.ones_like(self.fp8_meta[key].scale))
+                    self.fp8_meta[key].scale.copy_(
+                        torch.ones_like(self.fp8_meta[key].scale)
+                    )
                     self.fp8_meta[key].amax_history.copy_(
                         torch.zeros_like(self.fp8_meta[key].amax_history)
                     )
@@ -836,7 +876,9 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
 
         # Store FP8 state if needed
         state = None
-        fp8_checkpoint = self.fp8_meta["fp8_checkpoint"] or self.fp8 or self.fp8_calibration
+        fp8_checkpoint = (
+            self.fp8_meta["fp8_checkpoint"] or self.fp8 or self.fp8_calibration
+        )
         if not fp8_checkpoint:
             return torch.empty(0, dtype=torch.uint8)
 
@@ -845,9 +887,13 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
         state["recipe"] = self.fp8_meta["recipe"]
         if state["recipe"].delayed():
             state["scale_fwd"] = to_cpu(self.fp8_meta["scaling_fwd"].scale)
-            state["amax_history_fwd"] = to_cpu(self.fp8_meta["scaling_fwd"].amax_history)
+            state["amax_history_fwd"] = to_cpu(
+                self.fp8_meta["scaling_fwd"].amax_history
+            )
             state["scale_bwd"] = to_cpu(self.fp8_meta["scaling_bwd"].scale)
-            state["amax_history_bwd"] = to_cpu(self.fp8_meta["scaling_bwd"].amax_history)
+            state["amax_history_bwd"] = to_cpu(
+                self.fp8_meta["scaling_bwd"].amax_history
+            )
 
         # Store other pickelable values
         extra = {}
@@ -917,9 +963,13 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
         # Load tensors
         if self.fp8_meta["recipe"].delayed():
             copy_tensor(state["scale_fwd"], self.fp8_meta["scaling_fwd"].scale)
-            copy_tensor(state["amax_history_fwd"], self.fp8_meta["scaling_fwd"].amax_history)
+            copy_tensor(
+                state["amax_history_fwd"], self.fp8_meta["scaling_fwd"].amax_history
+            )
             copy_tensor(state["scale_bwd"], self.fp8_meta["scaling_bwd"].scale)
-            copy_tensor(state["amax_history_bwd"], self.fp8_meta["scaling_bwd"].amax_history)
+            copy_tensor(
+                state["amax_history_bwd"], self.fp8_meta["scaling_bwd"].amax_history
+            )
         torch.cuda.synchronize()
 
     def set_activation_dtype(self, inp: torch.Tensor) -> None:
@@ -1002,8 +1052,12 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
 
             # Set FP8_MAX per tensor according to recipe
             if hasattr(self.fp8_meta["recipe"], "fp8_format"):
-                self.fp8_meta["fp8_max_fwd"] = self.fp8_meta["recipe"].fp8_format.value.max_fwd
-                self.fp8_meta["fp8_max_bwd"] = self.fp8_meta["recipe"].fp8_format.value.max_bwd
+                self.fp8_meta["fp8_max_fwd"] = self.fp8_meta[
+                    "recipe"
+                ].fp8_format.value.max_fwd
+                self.fp8_meta["fp8_max_bwd"] = self.fp8_meta[
+                    "recipe"
+                ].fp8_format.value.max_bwd
 
             # Allocate scales and amaxes
             self.init_fp8_meta_tensors(self.fp8_meta["recipe"])
@@ -1064,11 +1118,15 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
                     )
 
                 if not FP8GlobalStateManager.fp8_graph_capturing():
-                    FP8GlobalStateManager.add_fp8_tensors_to_global_buffer(self.fp8_meta)
+                    FP8GlobalStateManager.add_fp8_tensors_to_global_buffer(
+                        self.fp8_meta
+                    )
 
                 # Activation recomputation is used and this is the first forward phase.
                 if self.training and is_fp8_activation_recompute_enabled():
-                    FP8GlobalStateManager.copy_forward_fp8_meta_tensors_for_recompute(self.fp8_meta)
+                    FP8GlobalStateManager.copy_forward_fp8_meta_tensors_for_recompute(
+                        self.fp8_meta
+                    )
 
         with get_nvtx_range_context(self.__class__.__name__ + " forward"):
             if not allow_non_contiguous and not inp.is_contiguous():
@@ -1111,9 +1169,11 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
         grad_output = grad_output.reshape((-1, grad_output.shape[-1]))
         grad_output = grad_output.contiguous()
         gather_grad_output = row_parallel_mode and ctx.sequence_parallel
+        keep_backward_unquantized = getattr(ctx, "keep_backward_unquantized", False)
+        use_fp8_bwd = ctx.fp8 and not keep_backward_unquantized
 
         # Non-FP8 case: bgrad is fused with wgrad for this case.
-        if not ctx.fp8 and not ctx.debug:
+        if not use_fp8_bwd and not ctx.debug:
             if gather_grad_output:
                 if not ctx.ub_overlap_ag:  # Perform NCCL all-gather
                     grad_output, _ = gather_along_first_dim(grad_output, ctx.tp_group)
@@ -1194,7 +1254,9 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
                     Float8BlockwiseQTensorStorage,
                 ),
             ):
-                grad_bias = grad_output.dequantize().view(-1, grad_output.shape[-1]).sum(dim=0)
+                grad_bias = (
+                    grad_output.dequantize().view(-1, grad_output.shape[-1]).sum(dim=0)
+                )
             else:
                 if isinstance(quantizer, Float8BlockQuantizer):
                     # unfuse bgrad for now until cast_transpose + dgrad calculation is ready for Float8BlockQuantizer.
@@ -1253,7 +1315,6 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
             fp8_meta_index = self.param_init_meta[name].fp8_meta_index
             high_precision_init_val = None
             if self.primary_weights_in_fp8 and fp8_meta_index is not None:
-
                 # Keep high-precision values on CPU if needed
                 if self.preserve_high_precision_init_val:
                     high_precision_init_val = param.detach().cpu()
@@ -1295,7 +1356,6 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
 
             # Keep high-precision values on CPU if needed
             if high_precision_init_val is not None:
-
                 # - Master weights are initialized from model weights, if we use fp8 primary
                 #   weights to initialize master weights, the numerical values of master weights
                 #   are not consistent with the numerical values when we initialize them from
@@ -1399,7 +1459,9 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
                     reset_cache = True
                 elif quantizer.columnwise_usage and out._columnwise_data is None:
                     reset_cache = True
-            if isinstance(out, DebugQuantizedTensor) != isinstance(quantizer, DebugQuantizer):
+            if isinstance(out, DebugQuantizedTensor) != isinstance(
+                quantizer, DebugQuantizer
+            ):
                 reset_cache = True
             if reset_cache:
                 out = None
@@ -1443,7 +1505,9 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
             update_workspace = True
         if update_workspace:
             if tensor is None:
-                raise ValueError("tensor kwarg must be provided to update FP8 workspace")
+                raise ValueError(
+                    "tensor kwarg must be provided to update FP8 workspace"
+                )
             if hasattr(out, "quantize_"):
                 out.quantize_(tensor, noop_flag=skip_update_flag)
             else:
@@ -1451,7 +1515,14 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
         return out
 
     def _load_from_state_dict(
-        self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
     ):
         """
         This function loads tensors and extra state including fp8 metadata.
@@ -1468,10 +1539,18 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
             if extra_state_key in state_dict:
                 self.set_extra_state(state_dict[extra_state_key])
         super()._load_from_state_dict(
-            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
         )
 
-    def register_wgrad_accumulation_and_reduce_hooks(self, wgrad_accumulation_and_reduce_hook):
+    def register_wgrad_accumulation_and_reduce_hooks(
+        self, wgrad_accumulation_and_reduce_hook
+    ):
         """
         This method is used to manually control the weight gradient accumulation and reduce.
         This method should be called before the backward() method.
@@ -1479,7 +1558,9 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
         and reduce in backward();
         And register the wgrad_accumulation_and_reduce_func to be called in backward_dw() method.
         """
-        self.wgrad_accumulation_and_reduce_hooks.append(wgrad_accumulation_and_reduce_hook)
+        self.wgrad_accumulation_and_reduce_hooks.append(
+            wgrad_accumulation_and_reduce_hook
+        )
 
     def need_backward_dw(self):
         """
@@ -1503,12 +1584,16 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
                 weight_tensor = noop_cat(self._get_weight_tensors())
                 weight_tensor.grad = wgrad.to(weight_tensor.dtype)
             if self.use_bias:
-                bias_tensor = noop_cat([getattr(self, name) for name in self.bias_names])
+                bias_tensor = noop_cat(
+                    [getattr(self, name) for name in self.bias_names]
+                )
                 if bias_tensor.grad is None:
                     bias_tensor.grad = bgrad.to(bias_tensor.dtype)
             del wgrad
             del bgrad
-            for wgrad_accumulation_and_reduce_hook in self.wgrad_accumulation_and_reduce_hooks:
+            for (
+                wgrad_accumulation_and_reduce_hook
+            ) in self.wgrad_accumulation_and_reduce_hooks:
                 wgrad_accumulation_and_reduce_hook()
 
     def is_debug_iter(self) -> bool:
@@ -1531,7 +1616,10 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
             if self.next_iter_when_debug_should_be_run is None:
                 debug = False
             else:
-                debug = TEDebugState.get_iteration() >= self.next_iter_when_debug_should_be_run
+                debug = (
+                    TEDebugState.get_iteration()
+                    >= self.next_iter_when_debug_should_be_run
+                )
             self.debug_last_iteration = TEDebugState.get_iteration()
             self.debug_enabled_in_this_iteration = debug
         else:
@@ -1549,7 +1637,9 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
 
         # Sometimes features inform that they will not be enabled for particular layer
         # for multiple next iterations.
-        self.next_iter_when_debug_should_be_run = next_iter_when_debug_should_be_run(quantizers)
+        self.next_iter_when_debug_should_be_run = next_iter_when_debug_should_be_run(
+            quantizers
+        )
 
         if not run_current:
             return True
