@@ -96,6 +96,17 @@ class _GroupedLinear(torch.autograd.Function):
         device = inp.device
         weight_requires_grad = weights[0].requires_grad
 
+        keep_rowwise_for_bwd = False
+        if fp8:
+            fp8_recipe = FP8GlobalStateManager.get_fp8_recipe()
+            keep_rowwise_for_bwd = hasattr(fp8_recipe, "fp8_bwd") and not fp8_recipe.fp8_bwd
+            if keep_rowwise_for_bwd:
+                if isinstance(input_quantizers[0], Float8Quantizer):
+                    raise ValueError(
+                        "keep-backward-unquantized is not supported with delayed scaling."
+                    )
+                save_original_input = True
+
         # Configure quantizers
         if save_original_input and isinstance(input_quantizers[0], Float8Quantizer):
             raise ValueError("DelayedScaling recipe is not supported with save_original_input")
@@ -218,7 +229,10 @@ class _GroupedLinear(torch.autograd.Function):
                 else:
                     for inputmat in inputmats:
                         if isinstance(inputmat, QuantizedTensorStorage):
-                            inputmat.update_usage(rowwise_usage=False, columnwise_usage=True)
+                            if keep_rowwise_for_bwd:
+                                inputmat.update_usage(rowwise_usage=True, columnwise_usage=True)
+                            else:
+                                inputmat.update_usage(rowwise_usage=False, columnwise_usage=True)
             else:
                 inputmats = [None] * num_gemms
 
@@ -265,6 +279,9 @@ class _GroupedLinear(torch.autograd.Function):
             ctx.activation_dtype = activation_dtype
             ctx.fp8 = fp8
             ctx.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe() if fp8 else None
+            ctx.fp8_bwd = True
+            if ctx.fp8_recipe is not None:
+                ctx.fp8_bwd = getattr(ctx.fp8_recipe, "fp8_bwd", True)
             ctx.fuse_wgrad_accumulation = fuse_wgrad_accumulation
             ctx.cpu_offloading = cpu_offloading
             ctx.is_first_microbatch = is_first_microbatch
@@ -309,9 +326,10 @@ class _GroupedLinear(torch.autograd.Function):
 
             # Preprocess grad output
             grad_output_view = grad_output.contiguous().view(-1, grad_output.shape[-1])
+            use_fp8_bwd = ctx.fp8 and getattr(ctx, "fp8_bwd", True)
             grad_output = [None] * ctx.num_gemms
             grad_biases = [None] * ctx.num_gemms
-            if ctx.fp8:
+            if ctx.fp8 and use_fp8_bwd:
                 if ctx.use_bias:
                     grad_output_mats = torch.split(grad_output_view, ctx.m_splits)
                     recipe = ctx.fp8_recipe
@@ -339,12 +357,14 @@ class _GroupedLinear(torch.autograd.Function):
                         ctx.grad_output_quantizers,
                     )
             else:
-                # Only split grad output. Grad bias is fused with
-                # wgrad GEMM.
+                # High precision grad output (keep-backward-unquantized)
                 grad_output = torch.split(
                     cast_if_needed(grad_output_view, ctx.activation_dtype),
                     ctx.m_splits,
                 )
+                if ctx.use_bias:
+                    for i in range(ctx.num_gemms):
+                        grad_biases[i] = grad_output[i].sum(dim=0)
 
             if ctx.is_first_microbatch is not None:
                 accumulate_wgrad_into_param_main_grad = (
@@ -366,14 +386,26 @@ class _GroupedLinear(torch.autograd.Function):
                     dtype=ctx.activation_dtype,
                     device=ctx.device,
                 )
+                weights_for_dgrad = weights
+                grad_output_for_dgrad = grad_output
+                if not use_fp8_bwd:
+                    weights_for_dgrad = origin_weights
+                    for w in weights_for_dgrad:
+                        assert not isinstance(
+                            w, QuantizedTensorStorage
+                        ), "keep-backward-unquantized expects high precision weights."
+                    for g in grad_output_for_dgrad:
+                        assert not isinstance(
+                            g, QuantizedTensorStorage
+                        ), "keep-backward-unquantized expects high precision grad_output."
                 # Make sure weights are available in column-wise format
                 # for dgrad computation.
-                for weight in weights:
+                for weight in weights_for_dgrad:
                     if isinstance(weight, QuantizedTensorStorage):
                         weight.update_usage(columnwise_usage=True)
                 general_grouped_gemm(
-                    weights,
-                    grad_output,
+                    weights_for_dgrad,
+                    grad_output_for_dgrad,
                     [dgrad],
                     ctx.activation_dtype,
                     single_output=True,
@@ -412,12 +444,24 @@ class _GroupedLinear(torch.autograd.Function):
                             else:
                                 input_quantizer.set_usage(rowwise=False, columnwise=True)
                     inputmats: list
-                    if ctx.fp8:
+                    if ctx.fp8 and use_fp8_bwd:
                         inputmats = tex.split_quantize(inp_view, ctx.m_splits, ctx.input_quantizers)
                     else:
                         inputmats = torch.split(
                             cast_if_needed(inp_view, ctx.activation_dtype), ctx.m_splits
                         )
+
+                inputmats_for_wgrad = inputmats
+                grad_output_for_wgrad = grad_output
+                if not use_fp8_bwd:
+                    for x in inputmats_for_wgrad:
+                        assert not isinstance(
+                            x, QuantizedTensorStorage
+                        ), "keep-backward-unquantized expects high precision input."
+                    for g in grad_output_for_wgrad:
+                        assert not isinstance(
+                            g, QuantizedTensorStorage
+                        ), "keep-backward-unquantized expects high precision grad_output."
 
                 grouped_gemm_wgrad = functools.partial(
                     general_grouped_gemm,
@@ -436,9 +480,14 @@ class _GroupedLinear(torch.autograd.Function):
                 )
                 # WGRAD
                 if ctx.wgrad_store is not None and ctx.wgrad_store.delay_wgrad_compute():
-                    ctx.wgrad_store.put([inputmats, grad_output, wgrad_list], grouped_gemm_wgrad)
+                    ctx.wgrad_store.put(
+                        [inputmats_for_wgrad, grad_output_for_wgrad, wgrad_list],
+                        grouped_gemm_wgrad,
+                    )
                 else:
-                    _, grad_biases_, _ = grouped_gemm_wgrad(inputmats, grad_output, wgrad_list)
+                    _, grad_biases_, _ = grouped_gemm_wgrad(
+                        inputmats_for_wgrad, grad_output_for_wgrad, wgrad_list
+                    )
 
                     for i in range(ctx.num_gemms):
                         if grad_biases[i] is None:

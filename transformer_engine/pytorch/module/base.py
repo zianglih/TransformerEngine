@@ -1111,10 +1111,14 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
         grad_output = grad_output.reshape((-1, grad_output.shape[-1]))
         grad_output = grad_output.contiguous()
         gather_grad_output = row_parallel_mode and ctx.sequence_parallel
+        use_fp8_bwd = getattr(ctx, "fp8_bwd", True)
 
         # Non-FP8 case: bgrad is fused with wgrad for this case.
-        if not ctx.fp8 and not ctx.debug:
+        if (not ctx.fp8 or not use_fp8_bwd) and not ctx.debug:
+            grad_bias = None
             if gather_grad_output:
+                if ctx.use_bias:
+                    grad_bias = grad_output.view(-1, grad_output.shape[-1]).sum(dim=0)
                 if not ctx.ub_overlap_ag:  # Perform NCCL all-gather
                     grad_output, _ = gather_along_first_dim(grad_output, ctx.tp_group)
                 else:  # Initialize Userbuffers all-gather
@@ -1124,7 +1128,10 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
                         None,
                         ctx.tp_group,
                     )
-            return grad_output, None
+                return grad_output, grad_bias
+            if ctx.use_bias:
+                grad_bias = grad_output.view(-1, grad_output.shape[-1]).sum(dim=0)
+            return grad_output, grad_bias
 
         # FP8 with all-gather: unfused bgrad, fused cast + transpose
         # Also supports debug quantization, which is handled inside gather_along_first_dim.
