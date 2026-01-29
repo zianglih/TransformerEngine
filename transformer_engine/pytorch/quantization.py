@@ -3,6 +3,7 @@
 # See LICENSE for license information.
 
 """Quantization utilities for TransformerEngine"""
+
 from __future__ import annotations
 
 import abc
@@ -49,9 +50,15 @@ def check_fp8_support() -> Tuple[bool, str]:
     if get_device_compute_capability() >= (9, 0):  # hopper and above
         return True, ""
     if get_device_compute_capability() < (8, 9):  # pre-ada
-        return False, "Device compute capability 8.9 or higher required for FP8 execution."
+        return (
+            False,
+            "Device compute capability 8.9 or higher required for FP8 execution.",
+        )
     if tex.get_cublasLt_version() < 120103:
-        return False, "CublasLt version 12.1.3.x or higher required for FP8 execution on Ada."
+        return (
+            False,
+            "CublasLt version 12.1.3.x or higher required for FP8 execution on Ada.",
+        )
     if float(torch.version.cuda) < 12.1:
         return False, "Cuda version 12.1 or higher required for FP8 execution on Ada."
     return True, ""
@@ -61,10 +68,16 @@ def check_fp8_support() -> Tuple[bool, str]:
 def check_mxfp8_support() -> Tuple[bool, str]:
     """Return if fp8 support is available"""
     if get_device_compute_capability() >= (12, 0):
-        return False, "MXFP8 (for all gemm layouts) is not supported on 12.0+ architectures yet."
+        return (
+            False,
+            "MXFP8 (for all gemm layouts) is not supported on 12.0+ architectures yet.",
+        )
     if get_device_compute_capability() >= (10, 0):  # blackwell and above
         return True, ""
-    return False, "Device compute capability 10.0 or higher required for MXFP8 execution."
+    return (
+        False,
+        "Device compute capability 10.0 or higher required for MXFP8 execution.",
+    )
 
 
 @functools.lru_cache(maxsize=None)
@@ -72,7 +85,10 @@ def check_nvfp4_support() -> Tuple[bool, str]:
     """Return if nvfp4 support is available"""
     if get_device_compute_capability() >= (10, 0):  # blackwell and above
         return True, ""
-    return False, "Device compute capability 10.0 or higher required for NVFP4 execution."
+    return (
+        False,
+        "Device compute capability 10.0 or higher required for NVFP4 execution.",
+    )
 
 
 @functools.lru_cache(maxsize=None)
@@ -185,7 +201,9 @@ def is_mxfp8_available(return_reason: bool = False) -> Union[bool, Tuple[bool, s
     return check_mxfp8_support()[0]
 
 
-def is_fp8_block_scaling_available(return_reason: bool = False) -> Union[bool, Tuple[bool, str]]:
+def is_fp8_block_scaling_available(
+    return_reason: bool = False,
+) -> Union[bool, Tuple[bool, str]]:
     """
     Determine if support is available for the FP8 block scaling recipe.
 
@@ -419,6 +437,11 @@ class FP8GlobalStateManager:
     def with_high_precision_init_val(cls) -> bool:
         """Should the high precision initial values be stored with FP8 parameters"""
         return cls.HIGH_PRECISION_INIT_VAL
+
+    @classmethod
+    def keep_backward_unquantized(cls) -> bool:
+        """Should backward skip FP8 quantization and use high precision"""
+        return bool(int(os.getenv("NVTE_KEEP_BACKWARD_UNQUANTIZED", "0")))
 
     @classmethod
     def fp8_graph_capturing(cls) -> bool:
@@ -1121,7 +1144,9 @@ class Float8CurrentScalingRecipeState(RecipeState):
 
         return [
             Float8CurrentScalingQuantizer(
-                self.dtype, device=self.device, force_pow_2_scales=self.recipe.use_power_2_scales
+                self.dtype,
+                device=self.device,
+                force_pow_2_scales=self.recipe.use_power_2_scales,
             )
             for i in range(self.num_quantizers)
         ]

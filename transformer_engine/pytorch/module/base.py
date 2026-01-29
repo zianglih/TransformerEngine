@@ -3,6 +3,7 @@
 # See LICENSE for license information.
 
 """Base modules and utilities for TransformerEngine PyTorch API"""
+
 import io
 import math
 import os
@@ -50,11 +51,16 @@ from ..utils import (
     torch_get_autocast_gpu_dtype,
     get_nvtx_range_context,
 )
-from ..tensor.storage.float8_blockwise_tensor_storage import Float8BlockwiseQTensorStorage
+from ..tensor.storage.float8_blockwise_tensor_storage import (
+    Float8BlockwiseQTensorStorage,
+)
 from ...common.recipe import DelayedScaling, Recipe
 from ...debug.pytorch.debug_state import TEDebugState
 from ...debug.pytorch.debug_quantization import DebugQuantizer, DebugQuantizedTensor
-from ...debug.pytorch.utils import next_iter_when_debug_should_be_run, any_feature_enabled
+from ...debug.pytorch.utils import (
+    next_iter_when_debug_should_be_run,
+    any_feature_enabled,
+)
 
 __all__ = ["initialize_ub", "destroy_ub", "UserBufferQuantizationMode"]
 
@@ -259,7 +265,12 @@ def initialize_ub(
         "fc2_dgrad",
         "fc2_wgrad",
     ]
-    layers_reduce_scatter_overlap = ["proj_fprop", "fc2_fprop", "qkv_wgrad", "fc1_wgrad"]
+    layers_reduce_scatter_overlap = [
+        "proj_fprop",
+        "fc2_fprop",
+        "qkv_wgrad",
+        "fc1_wgrad",
+    ]
     dgrad_reduce_scatter_overlap = ["qkv_dgrad", "fc1_dgrad"]
     # Default overlap methods for layers
     methods = {
@@ -448,7 +459,10 @@ def get_ub(name: str, use_fp8: bool):
     # For now use `use_fp8` boolean input as it matches the current design in the modules
     # So favour simplicity until the correct design becomes clear.
     # This is mainly an internal API so we don't need to worry about future changes
-    key = (name, UserBufferQuantizationMode.FP8 if use_fp8 else UserBufferQuantizationMode.NONE)
+    key = (
+        name,
+        UserBufferQuantizationMode.FP8 if use_fp8 else UserBufferQuantizationMode.NONE,
+    )
     assert _ub_communicators is not None, "UB manager is not initialized."
     assert key in _ub_communicators, f"UB for {name} with use_fp8={use_fp8} is not registered."
     return _ub_communicators[key]
@@ -526,7 +540,6 @@ def fill_userbuffers_buffer_for_all_gather(
 
     # MXFP8 data
     if isinstance(quantizer, MXFP8Quantizer):
-
         # Cast to MXFP8 if needed
         if not isinstance(local_tensor, MXFP8TensorStorage):
             if isinstance(local_tensor, QuantizedTensorStorage):
@@ -1111,9 +1124,11 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
         grad_output = grad_output.reshape((-1, grad_output.shape[-1]))
         grad_output = grad_output.contiguous()
         gather_grad_output = row_parallel_mode and ctx.sequence_parallel
+        keep_backward_unquantized = getattr(ctx, "keep_backward_unquantized", False)
+        use_fp8_bwd = ctx.fp8 and not keep_backward_unquantized
 
         # Non-FP8 case: bgrad is fused with wgrad for this case.
-        if not ctx.fp8 and not ctx.debug:
+        if not use_fp8_bwd and not ctx.debug:
             if gather_grad_output:
                 if not ctx.ub_overlap_ag:  # Perform NCCL all-gather
                     grad_output, _ = gather_along_first_dim(grad_output, ctx.tp_group)
@@ -1253,7 +1268,6 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
             fp8_meta_index = self.param_init_meta[name].fp8_meta_index
             high_precision_init_val = None
             if self.primary_weights_in_fp8 and fp8_meta_index is not None:
-
                 # Keep high-precision values on CPU if needed
                 if self.preserve_high_precision_init_val:
                     high_precision_init_val = param.detach().cpu()
@@ -1295,7 +1309,6 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
 
             # Keep high-precision values on CPU if needed
             if high_precision_init_val is not None:
-
                 # - Master weights are initialized from model weights, if we use fp8 primary
                 #   weights to initialize master weights, the numerical values of master weights
                 #   are not consistent with the numerical values when we initialize them from
@@ -1451,7 +1464,14 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
         return out
 
     def _load_from_state_dict(
-        self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
     ):
         """
         This function loads tensors and extra state including fp8 metadata.
@@ -1468,7 +1488,13 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
             if extra_state_key in state_dict:
                 self.set_extra_state(state_dict[extra_state_key])
         super()._load_from_state_dict(
-            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
         )
 
     def register_wgrad_accumulation_and_reduce_hooks(self, wgrad_accumulation_and_reduce_hook):
