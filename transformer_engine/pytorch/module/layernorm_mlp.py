@@ -228,6 +228,12 @@ class _LayerNormMLP(torch.autograd.Function):
             symmetric_ar_type,
             debug,
         ) = non_tensor_args
+        keep_backward_unquantized = fp8 and (
+            not FP8GlobalStateManager.get_fp8_recipe().quantize_backward
+        )
+        assert (
+            not keep_backward_unquantized
+        ), "NVTE_KEEP_BACKWARD_UNQUANTIZED is not implemented in LayerNormMLP"
 
         # Make sure input dimensions are compatible
         in_features, inp_shape = ln_weight.numel(), inp.shape
@@ -637,6 +643,7 @@ class _LayerNormMLP(torch.autograd.Function):
             ctx.tensor_objects = tensor_objects
 
             ctx.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe() if fp8 else None
+            ctx.keep_backward_unquantized = keep_backward_unquantized
             ctx.fc1_grad_input_quantizer = fc1_grad_input_quantizer
             ctx.fc1_grad_weight_quantizer = fc1_grad_weight_quantizer
             ctx.fc1_grad_output_quantizer = fc1_grad_output_quantizer
