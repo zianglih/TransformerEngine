@@ -23,7 +23,7 @@ from .base import (
     _2X_ACC_DGRAD,
     _2X_ACC_WGRAD,
 )
-from ._common import WeightGradStore
+from ._common import WeightGradStore, apply_nvfp4_per_token_activation_scaling
 from ..quantization import FP8GlobalStateManager
 from ..utils import (
     divide,
@@ -47,6 +47,7 @@ from ..jit import no_torch_dynamo
 from ..cpu_offload import is_cpu_offload_enabled, mark_not_offload, start_offload
 
 from ..tensor.float8_tensor import Float8CurrentScalingQuantizer, Float8Quantizer
+from ..tensor.nvfp4_tensor import NVFP4Quantizer
 from ..quantized_tensor import (
     QuantizedTensorStorage,
     Quantizer,
@@ -1129,6 +1130,25 @@ class GroupedLinear(TransformerEngineBaseModule):
                 grad_output_quantizers,
             ) = quantizers
 
+            use_nvfp4_per_token_activation = False
+            per_token_output_scales = None
+            if self.fp8 and not debug:
+                fp8_recipe = FP8GlobalStateManager.get_fp8_recipe()
+                use_nvfp4_per_token_activation = (
+                    fp8_recipe.nvfp4()
+                    and getattr(fp8_recipe, "per_token_activation", False)
+                    and all(
+                        quantizer is None or isinstance(quantizer, NVFP4Quantizer)
+                        for quantizer in input_quantizers
+                    )
+                )
+            if use_nvfp4_per_token_activation:
+                inp, per_token_output_scales = apply_nvfp4_per_token_activation_scaling(
+                    inp,
+                    m_splits,
+                )
+            use_bias_for_grouped_gemm = self.apply_bias and not use_nvfp4_per_token_activation
+
             if is_grad_enabled:
                 linear_fn = _GroupedLinear.apply
                 autograd_ctx = []
@@ -1146,7 +1166,7 @@ class GroupedLinear(TransformerEngineBaseModule):
 
             non_tensor_args = (
                 m_splits,
-                self.apply_bias,
+                use_bias_for_grouped_gemm,
                 is_first_microbatch,
                 self.fp8,
                 self.fp8_calibration,
@@ -1171,6 +1191,28 @@ class GroupedLinear(TransformerEngineBaseModule):
             out, new_workspaces = linear_fn(
                 *autograd_ctx, inp, non_tensor_args, *weight_tensors, *bias_tensors
             )
+
+            if per_token_output_scales is not None:
+                out_view = out.reshape(-1, out.shape[-1])
+                out_view = out_view * per_token_output_scales.to(dtype=out_view.dtype).unsqueeze(-1)
+
+                # Bias must be applied after row-wise output rescaling.
+                if self.apply_bias:
+                    out_chunks = []
+                    start = 0
+                    for split_size, bias in zip(m_splits, bias_tensors):
+                        split_size = int(split_size)
+                        if split_size > 0:
+                            out_chunks.append(
+                                out_view[start : start + split_size]
+                                + cast_if_needed(bias, out_view.dtype).unsqueeze(0)
+                            )
+                        else:
+                            out_chunks.append(out_view[start:start])
+                        start += split_size
+                    out = torch.cat(out_chunks, dim=0).view_as(out)
+                else:
+                    out = out_view.view_as(out)
 
             if cache_weight:
                 for i, ws in enumerate(new_workspaces):

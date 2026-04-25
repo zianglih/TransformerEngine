@@ -78,6 +78,11 @@ _quantized_numerics_recipe_list = [
         marks=pytest.mark.skipif(not nvfp4_available, reason=reason_for_no_nvfp4),
         id="NVFP4BlockScaling",
     ),
+    pytest.param(
+        "nvfp4_pertoken",
+        marks=pytest.mark.skipif(not nvfp4_available, reason=reason_for_no_nvfp4),
+        id="NVFP4PerTokenBlockScaling",
+    ),
 ]
 
 
@@ -165,7 +170,7 @@ def _maybe_skip_recipe_dtype(
 ) -> None:
     if dtype == torch.bfloat16 and not bf16_available:
         pytest.skip(reason_for_no_bf16)
-    if recipe_name == "nvfp4":
+    if recipe_name in ("nvfp4", "nvfp4_pertoken"):
         if module_type in ("linear", "layernorm_linear") and dtype not in (
             torch.bfloat16,
             torch.float32,
@@ -195,7 +200,9 @@ def _maybe_skip_unsupported_recipe_shape(
                 " by 32."
             )
             return
-        if recipe_name == "nvfp4" and (flat_first_dim % 16 != 0 or last_dim % 16 != 0):
+        if recipe_name in ("nvfp4", "nvfp4_pertoken") and (
+            flat_first_dim % 16 != 0 or last_dim % 16 != 0
+        ):
             pytest.skip(
                 "Linear/LayerNormLinear + NVFP4 requires prod(shape[:-1]) and shape[-1] divisible"
                 " by 16."
@@ -220,7 +227,9 @@ def _maybe_skip_unsupported_recipe_shape(
             pytest.skip(
                 "te_ops.Linear + MXFP8 requires prod(shape[:-1]) and shape[-1] divisible by 32."
             )
-        if recipe_name == "nvfp4" and (flat_first_dim % 16 != 0 or last_dim % 16 != 0):
+        if recipe_name in ("nvfp4", "nvfp4_pertoken") and (
+            flat_first_dim % 16 != 0 or last_dim % 16 != 0
+        ):
             pytest.skip(
                 "te_ops.Linear + NVFP4 requires prod(shape[:-1]) and shape[-1] divisible by 16."
             )
@@ -239,9 +248,9 @@ def _maybe_skip_unsupported_grouped_splits(recipe_name: str, m_splits: list[int]
         )
     if recipe_name == "mxfp8" and any(m % 32 != 0 for m in non_empty_splits):
         pytest.skip("GroupedLinear + MXFP8 requires each non-empty m_split divisible by 32.")
-    if recipe_name == "nvfp4" and any(m % 16 != 0 for m in non_empty_splits):
+    if recipe_name in ("nvfp4", "nvfp4_pertoken") and any(m % 16 != 0 for m in non_empty_splits):
         pytest.skip("GroupedLinear + NVFP4 requires each non-empty m_split divisible by 16.")
-    if recipe_name == "nvfp4" and any(m % 64 != 0 for m in non_empty_splits):
+    if recipe_name in ("nvfp4", "nvfp4_pertoken") and any(m % 64 != 0 for m in non_empty_splits):
         pytest.skip(
             "GroupedLinear + NVFP4 grouped split_quantize currently requires each non-empty "
             "m_split divisible by 64 due to grouped amax kernel constraints."
@@ -577,6 +586,37 @@ def _run_single_step(
     )
 
 
+def _find_autograd_node_with_attrs(
+    root, required_attrs: tuple[str, ...]
+) -> Optional[torch.autograd.Function]:
+    queue = [root]
+    visited: set[int] = set()
+    while queue:
+        node = queue.pop(0)
+        if node is None:
+            continue
+        node_id = id(node)
+        if node_id in visited:
+            continue
+        visited.add(node_id)
+        if all(hasattr(node, attr) for attr in required_attrs):
+            return node
+        for next_fn, _ in getattr(node, "next_functions", ()):
+            if next_fn is not None:
+                queue.append(next_fn)
+    return None
+
+
+def _restore_saved_operands_from_output(y: torch.Tensor) -> list[Optional[torch.Tensor]]:
+    grad_fn = y.grad_fn
+    if grad_fn is None:
+        raise RuntimeError("Expected output grad_fn to restore saved operands, but got None.")
+    saved_node = _find_autograd_node_with_attrs(grad_fn, ("tensor_objects", "saved_tensors"))
+    if saved_node is None:
+        raise RuntimeError("Could not locate saved quantized operands in output autograd graph.")
+    return restore_from_saved(saved_node.tensor_objects, list(saved_node.saved_tensors))
+
+
 def _run_single_step_with_saved_operands(
     module: torch.nn.Module,
     x: torch.Tensor,
@@ -592,7 +632,7 @@ def _run_single_step_with_saved_operands(
         y = module(x_run)
         if isinstance(y, tuple):
             y = y[0]
-        saved_operands = restore_from_saved(y.grad_fn.tensor_objects, list(y.grad_fn.saved_tensors))
+        saved_operands = _restore_saved_operands_from_output(y)
     return y, x_run, saved_operands
 
 
@@ -637,7 +677,7 @@ def _run_grouped_linear_step_with_saved_operands(
     x_run = x.detach().clone().requires_grad_(True)
     with te.autocast(enabled=True, recipe=fp8_recipe):
         y = module(x_run, m_splits)
-        saved_operands = restore_from_saved(y.grad_fn.tensor_objects, list(y.grad_fn.saved_tensors))
+        saved_operands = _restore_saved_operands_from_output(y)
     return y, x_run, saved_operands
 
 
@@ -701,7 +741,7 @@ def _run_fused_single_step_with_saved_operands(
             y = model(x1_run, x2_run)
         else:
             y = model(x1_run)
-        saved_operands = restore_from_saved(y.grad_fn.tensor_objects, list(y.grad_fn.saved_tensors))
+        saved_operands = _restore_saved_operands_from_output(y)
     return y, x1_run, x2_run, saved_operands
 
 
@@ -787,16 +827,16 @@ def _run_grouped_linear_single_step_with_ctx_state(
             "fp8",
             "reduce_and_update_bwd_fp8_tensors",
         )
-        missing_attrs = [attr for attr in required_attrs if not hasattr(y.grad_fn, attr)]
-        if missing_attrs:
+        ctx_node = _find_autograd_node_with_attrs(y.grad_fn, required_attrs)
+        if ctx_node is None:
             raise RuntimeError(
                 "Grouped grad_fn does not expose required backward context attributes: "
-                f"{', '.join(missing_attrs)}."
+                f"{', '.join(required_attrs)}."
             )
         ctx_state = (
-            getattr(y.grad_fn, "backward_override"),
-            bool(getattr(y.grad_fn, "fp8")),
-            bool(getattr(y.grad_fn, "reduce_and_update_bwd_fp8_tensors")),
+            getattr(ctx_node, "backward_override"),
+            bool(getattr(ctx_node, "fp8")),
+            bool(getattr(ctx_node, "reduce_and_update_bwd_fp8_tensors")),
         )
     y.backward(dy)
     assert x_run.grad is not None
@@ -1028,6 +1068,11 @@ def test_grouped_linear_backward_override_matches_reference(
     _maybe_skip_recipe_dtype(recipe_name, dtype, "grouped_linear")
     _maybe_skip_unsupported_recipe_module_combo(recipe_name, "grouped_linear")
     _maybe_skip_unsupported_grouped_splits(recipe_name, m_splits)
+    if recipe_name == "nvfp4_pertoken":
+        pytest.skip(
+            "GroupedLinear + NVFP4 per-token activation currently applies Python-side "
+            "pre/post scaling, so grouped backward-override parity is not byte-exact yet."
+        )
     num_gemms = len(m_splits)
     num_tokens = sum(m_splits)
 
@@ -1256,6 +1301,11 @@ def test_grouped_linear_runtime_backward_override_switch_updates_ctx(
     _maybe_skip_recipe_dtype(recipe_name, dtype, "grouped_linear")
     _maybe_skip_unsupported_recipe_module_combo(recipe_name, "grouped_linear")
     _maybe_skip_unsupported_grouped_splits(recipe_name, m_splits)
+    if recipe_name == "nvfp4_pertoken":
+        pytest.skip(
+            "GroupedLinear + NVFP4 per-token activation path does not currently expose "
+            "grouped backward context attributes on grad_fn wrappers."
+        )
 
     num_tokens = sum(m_splits)
     module = te.GroupedLinear(

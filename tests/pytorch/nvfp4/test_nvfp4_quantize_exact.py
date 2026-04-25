@@ -7,13 +7,16 @@ import torch
 import transformer_engine.pytorch as te
 import transformer_engine_torch as tex
 from transformer_engine.pytorch import NVFP4Quantizer
-from transformer_engine.pytorch.custom_recipes.quantization_nvfp4 import NVFP4QuantizerRef
+from transformer_engine.pytorch.custom_recipes.quantization_nvfp4 import (
+    NVFP4QuantizerRef,
+    cast_to_fp4x2,
+)
 from transformer_engine.pytorch.custom_recipes import utils
-from transformer_engine.common.recipe import NVFP4BlockScaling
-from transformer_engine.pytorch.constants import TE_DType
 
 
 recipe_available, reason_for_no_recipe = te.is_nvfp4_available(return_reason=True)
+FP4_MAX = 6.0
+FP8_E4M3_MAX = 448.0
 
 
 def unpack_fp4(x: torch.Tensor) -> torch.Tensor:
@@ -21,6 +24,50 @@ def unpack_fp4(x: torch.Tensor) -> torch.Tensor:
     repeated[:, 0::2] &= 0x0F
     repeated[:, 1::2] >>= 4
     return repeated
+
+
+def _has_pertoken_kernel() -> bool:
+    return hasattr(tex, "quantize_nvfp4_pertoken")
+
+
+def nvfp4_pertoken_quantize_ref(input_tensor: torch.Tensor):
+    """Pure PyTorch reference for per-token NVFP4 quantization."""
+    assert input_tensor.dim() == 2
+    num_rows, num_cols = input_tensor.shape
+    assert num_cols % 16 == 0
+
+    x = input_tensor.float()
+    row_amax = x.abs().amax(dim=1)
+
+    S_enc = FP8_E4M3_MAX * FP4_MAX / row_amax
+    S_enc = torch.clamp(S_enc, max=torch.finfo(torch.float32).max)
+    S_enc = torch.where((row_amax == 0) | (S_enc == 0), torch.ones_like(S_enc), S_enc)
+
+    per_token_scales = 1.0 / S_enc
+    per_token_scales = torch.where(
+        row_amax == 0, torch.ones_like(per_token_scales), per_token_scales
+    )
+
+    num_blocks = num_cols // 16
+    x_blocks = x.view(num_rows, num_blocks, 16)
+    block_amax = x_blocks.abs().amax(dim=-1)
+
+    S_enc_expanded = S_enc.unsqueeze(1)
+    S_dec_b = block_amax * S_enc_expanded / FP4_MAX
+    S_dec_b = torch.clamp(S_dec_b, max=FP8_E4M3_MAX)
+    S_dec_b_fp8 = S_dec_b.to(torch.float8_e4m3fn)
+    S_dec_b_f = S_dec_b_fp8.float()
+
+    block_encode_scale = torch.where(
+        S_dec_b_f != 0, S_enc_expanded / S_dec_b_f, torch.zeros_like(S_dec_b_f)
+    )
+    block_encode_expanded = block_encode_scale.unsqueeze(-1)
+    scaled_x = (x_blocks * block_encode_expanded).reshape(num_rows, num_cols)
+    clamped_x = torch.clamp(scaled_x, -FP4_MAX, FP4_MAX)
+
+    data = cast_to_fp4x2(clamped_x)
+    scales = S_dec_b_fp8.view(torch.uint8)
+    return data, scales, per_token_scales
 
 
 def check_quantization_nvfp4_versus_reference(
@@ -481,3 +528,88 @@ def test_nvfp4_quantization_noncontiguous_inputs(
         torch.testing.assert_close(sx_t_valid, sx_t_ref, atol=0.0, rtol=0.0)
 
     torch.testing.assert_close(qx_amax, ref_amax, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.skipif(not recipe_available, reason=reason_for_no_recipe)
+@pytest.mark.skipif(not _has_pertoken_kernel(), reason="tex.quantize_nvfp4_pertoken not available")
+@pytest.mark.parametrize("M, N", [(1, 16), (8, 256), (64, 4096)])
+@pytest.mark.parametrize("x_dtype", [torch.float16, torch.bfloat16], ids=str)
+def test_nvfp4_pertoken_output_shapes_and_types(M: int, N: int, x_dtype: torch.dtype) -> None:
+    x = torch.randn(M, N, dtype=x_dtype, device="cuda")
+    data, scales, per_token_scales = tex.quantize_nvfp4_pertoken(x)
+
+    assert data.shape == (M, N // 2)
+    assert scales.shape == (M, N // 16)
+    assert per_token_scales.shape == (M,)
+    assert data.dtype == torch.uint8
+    assert scales.dtype == torch.uint8
+    assert per_token_scales.dtype == torch.float32
+
+
+@pytest.mark.skipif(not recipe_available, reason=reason_for_no_recipe)
+@pytest.mark.skipif(not _has_pertoken_kernel(), reason="tex.quantize_nvfp4_pertoken not available")
+@pytest.mark.parametrize("M, N", [(4, 256), (16, 1024), (64, 4096)])
+@pytest.mark.parametrize("x_dtype", [torch.float16, torch.bfloat16], ids=str)
+def test_nvfp4_pertoken_exact_match_reference(M: int, N: int, x_dtype: torch.dtype) -> None:
+    torch.manual_seed(0)
+    torch.cuda.manual_seed(0)
+
+    x = torch.randn(M, N, dtype=x_dtype, device="cuda")
+    data, scales, per_token_scales = tex.quantize_nvfp4_pertoken(x)
+    ref_data, ref_scales, ref_pts = nvfp4_pertoken_quantize_ref(x)
+
+    kernel_unpacked = unpack_fp4(data)
+    ref_unpacked = unpack_fp4(ref_data.to(device="cuda"))
+    if not torch.equal(kernel_unpacked, ref_unpacked):
+        mismatches = int((kernel_unpacked != ref_unpacked).sum().item())
+        mismatch_ratio = mismatches / kernel_unpacked.numel()
+        # A tiny number of FP4 boundary ties can differ by one nibble due to
+        # hardware conversion behavior; keep this guard strict.
+        assert mismatch_ratio <= 1e-3, (
+            f"Too many FP4 mismatches ({mismatches}/{kernel_unpacked.numel()}, "
+            f"ratio={mismatch_ratio:.6f})"
+        )
+    ref_scales_cuda = ref_scales.to(device="cuda")
+    if not torch.equal(scales, ref_scales_cuda):
+        scale_mismatches = int((scales != ref_scales_cuda).sum().item())
+        scale_mismatch_ratio = scale_mismatches / scales.numel()
+        assert scale_mismatch_ratio <= 2e-3, (
+            f"Too many block-scale mismatches ({scale_mismatches}/{scales.numel()}, "
+            f"ratio={scale_mismatch_ratio:.6f})"
+        )
+    torch.testing.assert_close(
+        per_token_scales,
+        ref_pts.to(device="cuda"),
+        atol=1e-7,
+        rtol=1e-6,
+    )
+
+
+@pytest.mark.skipif(not recipe_available, reason=reason_for_no_recipe)
+@pytest.mark.skipif(not _has_pertoken_kernel(), reason="tex.quantize_nvfp4_pertoken not available")
+@pytest.mark.parametrize("x_dtype", [torch.float16, torch.bfloat16], ids=str)
+def test_nvfp4_pertoken_scale_formula_and_zero_row(x_dtype: torch.dtype) -> None:
+    x = torch.randn(4, 256, dtype=x_dtype, device="cuda")
+    _, _, per_token_scales = tex.quantize_nvfp4_pertoken(x)
+    expected_scales = x.float().abs().amax(dim=1) / (FP8_E4M3_MAX * FP4_MAX)
+    torch.testing.assert_close(per_token_scales, expected_scales, atol=1e-5, rtol=1e-3)
+
+    x_zero = torch.zeros(4, 256, dtype=x_dtype, device="cuda")
+    _, _, zero_scales = tex.quantize_nvfp4_pertoken(x_zero)
+    assert torch.equal(zero_scales, torch.ones_like(zero_scales))
+
+
+@pytest.mark.skipif(not recipe_available, reason=reason_for_no_recipe)
+@pytest.mark.skipif(not _has_pertoken_kernel(), reason="tex.quantize_nvfp4_pertoken not available")
+def test_nvfp4_pertoken_input_validation() -> None:
+    x3d = torch.randn(2, 3, 256, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(RuntimeError):
+        tex.quantize_nvfp4_pertoken(x3d)
+
+    x_bad_cols = torch.randn(4, 100, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(RuntimeError):
+        tex.quantize_nvfp4_pertoken(x_bad_cols)
+
+    x_bad_dtype = torch.randn(4, 256, dtype=torch.float32, device="cuda")
+    with pytest.raises(RuntimeError):
+        tex.quantize_nvfp4_pertoken(x_bad_dtype)

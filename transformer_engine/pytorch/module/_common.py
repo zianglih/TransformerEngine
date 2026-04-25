@@ -6,7 +6,7 @@
 
 import dataclasses
 import queue
-from typing import Any, Callable, List, Optional, Tuple, Union
+from typing import Any, Callable, List, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -177,6 +177,61 @@ def noop_cat(
     if is_in_onnx_export_mode():
         return torch.cat(tensors, dim=dim)
     return _NoopCatFunc.apply(dim, *tensors)
+
+
+def apply_nvfp4_per_token_activation_scaling(
+    input_: torch.Tensor,
+    split_sizes: Sequence[int],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply per-token pre-scaling to emulate row-wise NVFP4 global scales.
+
+    This helper prepares inputs for grouped GEMM-based NVFP4 forward paths
+    without introducing new kernels:
+      1. For each split independently, compute row-wise amax and split-wise amax.
+      2. Pre-scale each row by ``split_amax / row_amax`` before quantized GEMM.
+      3. Return inverse row scales so callers can post-scale GEMM outputs.
+
+    The scaling factors are computed from a detached view of the input and are
+    therefore treated as constants in autograd.
+    """
+    if input_.dim() < 2:
+        raise ValueError(
+            "apply_nvfp4_per_token_activation_scaling expects input with at least 2 dims"
+        )
+    input_2d = input_.reshape(-1, input_.shape[-1])
+    if sum(int(s) for s in split_sizes) != input_2d.shape[0]:
+        raise ValueError(
+            "split_sizes does not match flattened first dimension of input "
+            f"(sum={sum(int(s) for s in split_sizes)}, dim0={input_2d.shape[0]})"
+        )
+
+    row_scale = torch.ones(
+        input_2d.shape[0],
+        dtype=torch.float32,
+        device=input_2d.device,
+    )
+    detached_input = input_2d.detach()
+
+    offset = 0
+    for split_size in split_sizes:
+        split_size = int(split_size)
+        if split_size <= 0:
+            continue
+        end = offset + split_size
+        chunk = detached_input[offset:end]
+        row_amax = chunk.abs().amax(dim=1).to(torch.float32)
+        split_amax = row_amax.max()
+        if torch.isfinite(split_amax) and split_amax > 0:
+            chunk_scale = row_scale[offset:end]
+            valid = (row_amax > 0) & torch.isfinite(row_amax)
+            if valid.any():
+                chunk_scale[valid] = split_amax / row_amax[valid]
+        offset = end
+
+    scaled_input = (
+        input_2d * row_scale.to(dtype=input_2d.dtype, device=input_2d.device).unsqueeze(-1)
+    ).reshape_as(input_)
+    return scaled_input, row_scale.reciprocal()
 
 
 @dataclasses.dataclass

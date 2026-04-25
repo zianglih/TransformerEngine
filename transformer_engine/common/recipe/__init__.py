@@ -478,6 +478,11 @@ class NVFP4BlockScaling(Recipe):
              If set to `True`, stochastic rounding is disabled during quantization for all tensors.
     disable_2d_quantization : bool, default = False
              If set to `True`, 1D block scaling with block size 16 is used for all tensors.
+    per_token_activation : bool, default = False
+             If set to `True`, GroupedLinear forward applies a per-token NVFP4 activation
+             workaround using dense/grouped GEMM plus Python-side row-wise pre/post scaling.
+             This affects activation quantization scope for MoE FC1/FC2 forward paths while
+             leaving weight quantization unchanged.
     backward_override : {None, 'high_precision', 'dequantized'}, default = None
             Backward precision mode. None does not modify backward behavior,
             `high_precision` keeps original high-precision operands for backward,
@@ -491,6 +496,7 @@ class NVFP4BlockScaling(Recipe):
         os.getenv("NVTE_NVFP4_DISABLE_STOCHASTIC_ROUNDING", "0") == "1"
     )
     disable_2d_quantization: bool = os.getenv("NVTE_NVFP4_DISABLE_2D_QUANTIZATION", "0") == "1"
+    per_token_activation: bool = os.getenv("NVTE_NVFP4_PER_TOKEN_ACTIVATION", "0") == "1"
 
     fp4_format: Format = Format.E2M1
     fp8_format: Format = Format.E4M3
@@ -534,6 +540,7 @@ class NVFP4BlockScaling(Recipe):
             f"fp8_dpa={self.fp8_dpa}, "
             f"fp8_mha={self.fp8_mha}, "
             f"backward_override={self.backward_override}, "
+            f"per_token_activation={self.per_token_activation}, "
             f"fp4_quant_fwd_inp={self.fp4_quant_fwd_inp}, "
             f"fp4_quant_fwd_weight={self.fp4_quant_fwd_weight}, "
             f"fp4_quant_bwd_grad={self.fp4_quant_bwd_grad}, "

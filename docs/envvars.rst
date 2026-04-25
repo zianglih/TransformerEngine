@@ -281,6 +281,12 @@ Kernel Configuration
    :Default: ``0``
    :Description: Emit a warning when falling back from CUTLASS to cuBLAS for grouped GEMM operations.
 
+.. envvar:: NVTE_NVFP4_PER_TOKEN_ACTIVATION
+
+   :Type: ``int`` (0 or 1)
+   :Default: ``0``
+   :Description: Enable per-token activation scaling for the ``NVFP4BlockScaling`` recipe in GroupedLinear forward paths. When set to ``1`` (or when ``NVFP4BlockScaling(per_token_activation=True)`` is used), Transformer Engine applies a Python-side row-wise pre/post scaling workaround around grouped GEMM so MoE FC1/FC2 activations behave like per-token NVFP4 global scaling without introducing new kernels.
+
 Torch Compilation and Fusion
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
