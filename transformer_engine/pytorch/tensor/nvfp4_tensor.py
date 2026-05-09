@@ -629,6 +629,8 @@ class NVFP4Tensor(NVFP4TensorStorage, QuantizedTensor):
             columnwise_usage,
             self._amax_rowwise,
             self._amax_columnwise,
+            self._row_scaled_nvfp4,
+            self._use_4over6,
             self.shape[-1],
         )
         return sharded_tensors, metadata
@@ -647,7 +649,15 @@ class NVFP4Tensor(NVFP4TensorStorage, QuantizedTensor):
         all-gathered rowwise data. Columnwise data is derived locally
         via _create_columnwise() instead of being all-gathered.
         """
-        fp4_dtype, columnwise_usage, amax_rowwise, amax_columnwise, K = metadata
+        (
+            fp4_dtype,
+            columnwise_usage,
+            amax_rowwise,
+            amax_columnwise,
+            row_scaled_nvfp4,
+            use_4over6,
+            K,
+        ) = metadata
 
         # Only rowwise data+scales were all-gathered
         rowwise_data, rowwise_scale_inv = all_gather_outputs[:2]
@@ -670,6 +680,8 @@ class NVFP4Tensor(NVFP4TensorStorage, QuantizedTensor):
             out._rowwise_scale_inv = rowwise_scale_inv
             out._amax_rowwise = amax_rowwise
             out._amax_columnwise = amax_columnwise
+            out._row_scaled_nvfp4 = row_scaled_nvfp4
+            out._use_4over6 = use_4over6
         else:
             # Construct new tensor (first iteration)
             out = NVFP4Tensor(
@@ -685,6 +697,8 @@ class NVFP4Tensor(NVFP4TensorStorage, QuantizedTensor):
                 quantizer=self._quantizer,
                 requires_grad=False,
                 with_gemm_swizzled_scales=False,
+                row_scaled_nvfp4=row_scaled_nvfp4,
+                use_4over6=use_4over6,
             )
 
         # Derive columnwise data locally via transpose instead of all-gathering it
@@ -823,6 +837,8 @@ class NVFP4Tensor(NVFP4TensorStorage, QuantizedTensor):
                 quantizer=tensor._quantizer,
                 requires_grad=tensor.requires_grad,
                 with_gemm_swizzled_scales=tensor._with_gemm_swizzled_scales,
+                row_scaled_nvfp4=tensor._row_scaled_nvfp4,
+                use_4over6=tensor._use_4over6,
             )
 
         # Default case
@@ -842,6 +858,8 @@ class NVFP4Tensor(NVFP4TensorStorage, QuantizedTensor):
         dtype: torch.dtype,
         quantizer: Quantizer,
         with_gemm_swizzled_scales: bool = False,
+        row_scaled_nvfp4: bool = False,
+        use_4over6: bool = False,
     ) -> NVFP4Tensor:
         """Build NVFP4Tensor, for use in __reduce__
 
@@ -862,6 +880,8 @@ class NVFP4Tensor(NVFP4TensorStorage, QuantizedTensor):
             quantizer=quantizer,
             requires_grad=False,
             with_gemm_swizzled_scales=with_gemm_swizzled_scales,
+            row_scaled_nvfp4=row_scaled_nvfp4,
+            use_4over6=use_4over6,
         )
 
     def __reduce_ex__(self, protocol: int) -> tuple:
@@ -880,6 +900,8 @@ class NVFP4Tensor(NVFP4TensorStorage, QuantizedTensor):
                 self.dtype,
                 self._quantizer,
                 self._with_gemm_swizzled_scales,
+                self._row_scaled_nvfp4,
+                self._use_4over6,
             ),
         )
 
@@ -932,6 +954,8 @@ class NVFP4Tensor(NVFP4TensorStorage, QuantizedTensor):
             self._amax_rowwise = tensor._amax_rowwise
             self._amax_columnwise = tensor._amax_columnwise
             self._with_gemm_swizzled_scales = tensor._with_gemm_swizzled_scales
+            self._row_scaled_nvfp4 = tensor._row_scaled_nvfp4
+            self._use_4over6 = tensor._use_4over6
             return
 
         # Quantize to FP8
@@ -1052,6 +1076,8 @@ class _ViewFunc(torch.autograd.Function):
             fp4_dtype=tensor._fp4_dtype,
             requires_grad=tensor.requires_grad,
             with_gemm_swizzled_scales=tensor._with_gemm_swizzled_scales,
+            row_scaled_nvfp4=tensor._row_scaled_nvfp4,
+            use_4over6=tensor._use_4over6,
         )
 
     @staticmethod
@@ -1094,6 +1120,8 @@ class _ViewFunc(torch.autograd.Function):
                 fp4_dtype=grad._fp4_dtype,
                 requires_grad=grad.requires_grad,
                 with_gemm_swizzled_scales=grad._with_gemm_swizzled_scales,
+                row_scaled_nvfp4=grad._row_scaled_nvfp4,
+                use_4over6=grad._use_4over6,
             )
             return dgrad, None
         return grad.view(ctx.shape), None
@@ -1178,6 +1206,8 @@ class _ReshapeFunc(torch.autograd.Function):
             fp4_dtype=tensor._fp4_dtype,
             requires_grad=tensor.requires_grad,
             with_gemm_swizzled_scales=tensor._with_gemm_swizzled_scales,
+            row_scaled_nvfp4=tensor._row_scaled_nvfp4,
+            use_4over6=tensor._use_4over6,
         )
 
     @staticmethod
@@ -1220,6 +1250,8 @@ class _ReshapeFunc(torch.autograd.Function):
                 fp4_dtype=grad._fp4_dtype,
                 requires_grad=grad.requires_grad,
                 with_gemm_swizzled_scales=grad._with_gemm_swizzled_scales,
+                row_scaled_nvfp4=grad._row_scaled_nvfp4,
+                use_4over6=grad._use_4over6,
             )
             return dgrad, None
         return grad.view(ctx.shape), None
