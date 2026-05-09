@@ -331,6 +331,10 @@ class Tensor {
     tensor_.set_row_scaled_nvfp4(row_scaled_nvfp4);
   }
 
+  void set_nvfp4_4over6(bool nvfp4_4over6) {
+    tensor_.set_nvfp4_4over6(nvfp4_4over6);
+  }
+
   void to_cpu() const;
   void from_cpu() const;
   void set_scale(float scale);

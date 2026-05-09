@@ -1376,6 +1376,7 @@ class NVFP4BlockScalingRecipeState(RecipeState):
                     with_2d_quantization=qparams.fp4_2d_quantization,
                     stochastic_rounding=qparams.stochastic_rounding,
                     row_scaled_nvfp4=self.recipe.row_scaled_activation and idx % 3 != 1,
+                    use_4over6=self.recipe.enable_4over6,
                 )
 
             return [_make_quantizer(idx) for idx in range(self.num_quantizers)]
@@ -1391,6 +1392,7 @@ class NVFP4BlockScalingRecipeState(RecipeState):
                     with_2d_quantization=self.recipe.fp4_quant_bwd_grad.fp4_2d_quantization,
                     stochastic_rounding=self.recipe.fp4_quant_bwd_grad.stochastic_rounding,
                     row_scaled_nvfp4=False,
+                    use_4over6=self.recipe.enable_4over6,
                 )
                 for _ in range(self.num_quantizers)
             ]
