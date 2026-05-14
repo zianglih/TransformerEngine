@@ -209,8 +209,10 @@ def general_gemm(
     }
 
     if not _is_nvfp4_row_scaled_tensor(A) and not _is_nvfp4_row_scaled_tensor(B):
+        print("@@@ NOT Row-scaled NVFP4 GEMM")
         out, bias_grad, gelu_input, extra_output = tex.generic_gemm(*args, **kwargs)
     else:
+        print("@@@ Row-scaled NVFP4 GEMM")
         if _is_nvfp4_row_scaled_tensor(A):
             raise NotImplementedError("Row-scaled NVFP4 GEMM does not support row-scaled A.")
         assert layout[1] == "N", "Row-scaled NVFP4 GEMM currently supports N-layout B only."
@@ -322,8 +324,10 @@ def general_grouped_gemm(
         bias_dtype = TE_DType[torch.bfloat16]
 
     if any(_is_nvfp4_row_scaled_tensor(tensor) for tensor in A):
+        print("@@@ NOT Row-scaled NVFP4 grouped GEMM")
         raise NotImplementedError("Row-scaled NVFP4 grouped GEMM does not support row-scaled A.")
     if any(_is_nvfp4_row_scaled_tensor(tensor) for tensor in B):
+        print("@@@ Row-scaled NVFP4 grouped GEMM")
         assert D_dtype is None, "Row-scaled NVFP4 grouped GEMM currently does not support D_dtype."
         if single_output:
             assert (
